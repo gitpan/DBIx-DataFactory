@@ -1,0 +1,360 @@
+package DBIx::DataFactory;
+
+use strict;
+use warnings;
+use Carp;
+
+our $VERSION = '0.0.1';
+
+use base qw(Class::Data::Inheritable Class::Accessor::Fast);
+__PACKAGE__->mk_classdata('defined_types' => {});
+__PACKAGE__->mk_accessors(qw(
+    username password dsn
+));
+
+__PACKAGE__->add_type('DBIx::DataFactory::Type::Int');
+__PACKAGE__->add_type('DBIx::DataFactory::Type::Num');
+__PACKAGE__->add_type('DBIx::DataFactory::Type::Str');
+__PACKAGE__->add_type('DBIx::DataFactory::Type::Set');
+
+use Smart::Args;
+use DBIx::Inspector;
+use DBI;
+use SQL::Maker;
+use Sub::Install;
+use Class::Load qw/load_class/;
+
+use DBIx::DataFactory::Type;
+
+sub create_factory_method {
+    args my $self,
+         my $method   => 'Str',
+         my $table    => 'Str',
+         my $dsn      => {isa => 'Str', optional => 1},
+         my $username => {isa => 'Str', optional => 1},
+         my $password => {isa => 'Str', optional => 1},
+         my $auto_inserted_columns => {
+             isa => 'HashRef', optional => 1, default => {},
+         };
+
+    $username = $self->username unless $username;
+    $password = $self->password unless $password;
+    $dsn      = $self->dsn      unless $dsn;
+    unless (defined $username && defined $password && defined $dsn) {
+        croak('username, password and dsn for database are all required');
+    }
+
+    my $dbh = DBI->connect($dsn, $username, $password);
+    my $inspector = DBIx::Inspector->new(dbh => $dbh)
+        or croak('cannot connect database');
+
+    my ($inspector_table) = grep {$_->name eq $table} $inspector->tables;
+    croak("cannot find table named $table") unless $inspector_table;
+
+    my $table_columns = [map {$_->name} $inspector_table->columns];
+
+    my ($package) = caller;
+    Sub::Install::install_sub({
+        code => sub {
+            my (%args) = @_;
+            return $self->_factory_method(
+                dsn            => $dsn,
+                username       => $username,
+                password       => $password,
+                table          => $table,
+                column_names   => $table_columns,
+                auto_inserted_columns => $auto_inserted_columns,
+                params         => \%args,
+            );
+        },
+        into => $package,
+        as   => $method,
+    });
+
+    return;
+}
+
+sub add_type {
+    my ($class, $type) = @_;
+    load_class($type);
+    $class->defined_types->{$type->type_name} = $type;
+}
+
+sub _make_value_from_type_info {
+    my ($class, $args) = @_;
+
+    my $copy_arg = {};
+    %$copy_arg = %$args;
+    my $type_name = delete $copy_arg->{type};
+    my $type_class = $class->defined_types->{$type_name}
+        or croak("$type_name is not defined as type");
+
+    return $type_class->make_value(%$copy_arg);
+}
+
+sub _factory_method {
+    my ($self, %args) = @_;
+    my $dsn            = $args{dsn};
+    my $username       = $args{username};
+    my $password       = $args{password};
+    my $table          = $args{table};
+    my $columns        = $args{column_names};
+    my $params         = $args{params};
+    my $auto_inserted_columns = $args{auto_inserted_columns};
+
+    my $values = {};
+    for my $column (@$columns) {
+        # insert specified value if specified
+        my $specified = $params->{$column};
+        if (defined $specified) {
+            $values->{$column} = $specified;
+            next;
+        }
+
+        # insert setting columns value
+        my $default = $auto_inserted_columns->{$column};
+        if (ref $default eq 'CODE') {
+            $values->{$column} = $default->();
+            next;
+        }
+        elsif (ref $default eq 'HASH') {
+            my $value = DBIx::DataFactory->_make_value_from_type_info($default);
+            $values->{$column} = $value;
+            next;
+        }
+    }
+
+    # make sql
+    my ($driver)  = $dsn =~ /^dbi:([^:]+)/i;
+    my $builder = SQL::Maker->new(driver => $driver);
+    my ($sql, @binds) = $builder->insert($table, $values);
+
+    # insert
+    my $dbh = DBI->connect($dsn, $username, $password);
+    my $sth = $dbh->prepare($sql);
+    $sth->execute(@binds);
+
+    return $values;
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+DBIx::DataFactory - factory method maker for inserting test data
+
+=head1 SYNOPSIS
+
+    # schema
+    CREATE TABLE test_factory (
+      `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+      `int` int,
+      `double` double,
+      `string` varchar(255),
+      `text` text DEFAULT NULL,
+
+      PRIMARY KEY (id)
+    ) DEFAULT CHARSET=binary;
+
+    # in your t/*.t
+    use DBIx::DataFactory;
+    my $factory_maker = DBIx::DataFactory->new({
+        username => 'nobody',
+        password => 'nobody',
+        dsn      => 'dbi:mysql:dbname=test_factory;host=localhost',
+    });
+    $factory_maker->create_factory_method(
+        method   => 'create_factory_data',
+        table    => 'test_factory',
+        auto_inserted_columns => {
+            int => {
+                type => 'Int',
+                size => 8,
+            },
+            double => sub { rand(100) },
+            string => {
+                type => 'Str',
+                size => 10,
+            },
+        },
+    );
+
+    my $values = create_factory_data(
+        text => 'test text',
+    );
+    my $int  = $values->{int};
+    my $text = $values->{text};
+
+    # will insert following data
+    # +----+----------+------------------+------------+-----------+
+    # | id | int      | double           | string     | text      |
+    # +----+----------+------------------+------------+-----------+
+    # |  1 | 60194256 | 3.03977754238112 | fHt4X0JDr9 | test text |
+    # +----+----------+------------------+------------+-----------+
+
+    $values = create_factory_data(
+        int    => 1,
+        string => 'test',
+    );
+
+    # will insert following data
+    # +----+------+-----------------+--------+------+
+    # | id | int  | double          | string | text |
+    # +----+------+-----------------+--------+------+
+    # |  2 |    1 | 71.159467713824 | test   | NULL |
+    # +----+------+-----------------+--------+------+
+
+=head1 DESCRIPTION
+
+This module helps you to make factory method for inserting data into database.
+
+=head1 METHODS
+
+=head2 $class->new(%args)
+
+Create a new DBIx::DataFactory object.
+
+    my $factory_maker = DBIx::DataFactory->new({
+        username => 'nobody',
+        password => 'nobody',
+        dsn      => 'dbi:mysql:dbname=test_factory;host=localhost',
+    });
+
+Set up initial state by following parameters.
+
+=over 4
+
+=item * username
+
+Database username.
+
+=item * password
+
+Database password
+
+=item *  dsn
+
+Database dsn
+
+=back
+
+=head2 $self->create_factory_method(%args)
+
+This installs the method, which helps inserting data into database, in the caller's package.
+
+    $factory_maker->create_factory_method(
+        method   => 'create_factory_data',
+        table    => 'test_factory',
+        auto_inserted_columns => {
+            int => {
+                type => 'Int',
+                size => 8,
+            },
+            string => {
+                type => 'Str',
+                size => 10,
+            },
+        },
+    );
+
+if this is the case, this make the method named 'create_factory_data'.  you can pass all columns value you defined in schema.
+
+    my $values = create_factory_data(
+        int    => 5,
+        string => 'string',
+        text   => 'test text',
+    );
+
+    # this makes following data.
+    +----+-----+--------+-----------+
+    | id | int | string | text      |
+    +----+-----+--------+-----------+
+    |  1 |  5  | string | test text |
+    +----+-----+--------+-----------+
+
+
+    my $values = create_factory_data;
+
+    # this makes following data
+    +----+----------+------------+------+
+    | id | int      | string     | text |
+    +----+----------+------------+------+
+    |  2 | 59483011 | 9svzODgYyz | NULL |
+    +----+----------+------------+------+
+
+=head3 Parameters
+
+=over 4
+
+=item * method
+
+Required parameter.  method name you want to create.
+
+=item * table
+
+Required parameter.  database table name.
+
+=item * dsn
+
+optional parameter.  database dsn.
+
+=item * username
+
+optional parameter.  database username.
+
+=item * password
+
+optional parameter.  database password.
+
+=item * auto_inserted_columns
+
+optional parameter.  if you have the table column which you want to insert data into automatically by default, you can specify this parameter.
+
+for example, if you have columns named 'int', 'string', and 'text', you can specify following.
+
+    $factory_maker->create_factory_method(
+        method   => 'create_factory_data',
+        table    => 'test_factory',
+        auto_inserted_columns => {
+            int => {
+                type => 'Int',
+                size => 8,
+            },
+            string => {
+                type => 'Str',
+                size => 10,
+            },
+            text => sub { String::Random->new->randregex('[a-z]{50}') }
+        },
+    );
+
+if passed hashref, the method inserts data which is defined in specified type class automatically by default.  see also DBIx::DataFactory::Type.
+
+if passed coderef, the method inserts value which the code returns.
+
+Of cource, if you specify column value in installed method, the setting for the column is not used.
+
+=back
+
+=head2 add_type
+
+you can add type class which define the rule of inserting data.  See also DBIx::DataFactory::Type.
+
+    DBIx::DataFactory->add_type('DBIx::DataFactory::Type::Test');
+
+=head1 REPOSITORY
+
+https://github.com/shibayu36/p5-DBIx-DataFactory
+
+=head1 AUTHOR
+
+  C<< <shibayu36 {at} gmail.com> >>
+
+=head1 LICENCE AND COPYRIGHT
+
+Copyright (c) 2011, Yuki Shibazaki C<< <shibayu36 {at} gmail.com> >>. All rights reserved.
+
+This module is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself. See L<perlartistic>.

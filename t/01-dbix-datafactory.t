@@ -10,7 +10,6 @@ use Test::mysqld;
 use DBI;
 use DBIx::DataFactory;
 use Path::Class;
-use DBIx::Simple;
 
 sub startup : Test(startup) {
     my $self = shift;
@@ -28,30 +27,6 @@ sub startup : Test(startup) {
     $self->mysqld($mysqld);
     $self->dbh($dbh);
 }
-
-my $factory_maker = DBIx::DataFactory->new({
-    username => 'root',
-    password => '',
-    dsn      => 'dbi:mysql:dbname=test_factory;host=localhost',
-});
-$factory_maker->create_factory_method(
-    method   => 'create_factory_data',
-    table    => 'test_factory',
-    auto_inserted_columns => {
-        int => {
-            type => 'Int',
-            size => 8,
-        },
-        string => {
-            type => 'Str',
-            size => 10,
-        },
-    },
-);
-
-create_factory_data(text => 'test text');
-
-
 
 sub _create_factory_method : Test(11) {
     my $self = shift;
@@ -75,13 +50,14 @@ sub _create_factory_method : Test(11) {
         },
     );
 
-    my $db = DBIx::Simple->connect($self->mysqld->dsn(dbname => 'test_factory'), 'root', '');
+    my $dbh = DBI->connect($self->mysqld->dsn(dbname => 'test_factory'), 'root', '');
 
     # check random value
-    my $values = create_factory_data();
-    my $row = $db->query(
-        'select * from test_factory where `int` = ?', $values->{int}
-    )->hashes->[0];
+    my $values = $factory_maker->create_factory_data();
+    my $row = $dbh->selectrow_hashref(
+        'select * from test_factory where `int` = ?', {}, $values->{int},
+    );
+
     ok $row;
     is $row->{int}, $values->{int};
     ok $row->{int} < 100000000;
@@ -90,10 +66,11 @@ sub _create_factory_method : Test(11) {
     ok !$row->{text};
 
     # check specified value
-    $values = create_factory_data(string => 'test1', text => 'texttest');
-    $row = $db->query(
-        'select * from test_factory where `int` = ?', $values->{int}
-    )->hashes->[0];
+    $values = $factory_maker->create_factory_data(string => 'test1', text => 'texttest');
+    $row = $dbh->selectrow_hashref(
+        'select * from test_factory where `int` = ?', {}, $values->{int},
+    );
+
     ok $row;
     is $row->{int}, $values->{int};
     ok $row->{int} < 100000000;
@@ -109,7 +86,7 @@ sub _create_factory_method_specify_sub : Test(6) {
         dsn      => $self->mysqld->dsn(dbname => 'test_factory'),
     });
     $factory_maker->create_factory_method(
-        method   => 'create_factory_data',
+        method   => 'create_factory_data_sub',
         table    => 'test_factory',
         auto_inserted_columns => {
             int => {
@@ -120,12 +97,47 @@ sub _create_factory_method_specify_sub : Test(6) {
         },
     );
 
-    my $db = DBIx::Simple->connect($self->mysqld->dsn(dbname => 'test_factory'), 'root', '');
+    my $dbh = DBI->connect($self->mysqld->dsn(dbname => 'test_factory'), 'root', '');
 
-    my $values = create_factory_data();
-    my $row = $db->query(
-        'select * from test_factory where `int` = ?', $values->{int}
-    )->hashes->[0];
+    my $values = $factory_maker->create_factory_data_sub();
+    my $row = $dbh->selectrow_hashref(
+        'select * from test_factory where `int` = ?', {}, $values->{int},
+    );
+    ok $row;
+    is $row->{int}, $values->{int};
+    ok $row->{int} < 100000000;
+    is $row->{string}, $values->{string};
+    like $row->{string}, qr{[a-z]{20}};
+    ok !$row->{text};
+}
+
+sub _create_factory_method_install_package : Test(6) {
+    my $self = shift;
+    my $factory_maker = DBIx::DataFactory->new({
+        username => 'root',
+        password => '',
+        dsn      => $self->mysqld->dsn(dbname => 'test_factory'),
+    });
+    $factory_maker->create_factory_method(
+        method   => 'create_factory_data_package',
+        table    => 'test_factory',
+        auto_inserted_columns => {
+            int => {
+                type => 'Int',
+                size => 8,
+            },
+            string => sub { return String::Random->new->randregex('[a-z]{20}') },
+        },
+        install_package => 'test::DBIx::DataFactory',
+    );
+
+    my $dbh = DBI->connect($self->mysqld->dsn(dbname => 'test_factory'), 'root', '');
+
+    my $values = $self->create_factory_data_package();
+    my $row = $dbh->selectrow_hashref(
+        'select * from test_factory where `int` = ?', {}, $values->{int},
+    );
+
     ok $row;
     is $row->{int}, $values->{int};
     ok $row->{int} < 100000000;

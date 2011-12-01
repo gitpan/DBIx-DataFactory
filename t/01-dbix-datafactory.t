@@ -28,7 +28,7 @@ sub startup : Test(startup) {
     $self->dbh($dbh);
 }
 
-sub _create_factory_method : Test(12) {
+sub _create_factory_method : Test(14) {
     my $self = shift;
     my $factory_maker = DBIx::DataFactory->new({
         username => 'root',
@@ -65,9 +65,10 @@ sub _create_factory_method : Test(12) {
     is $row->{string}, $values->{string};
     like $row->{string}, qr{[a-zA-Z0-9]{10}};
     ok !$row->{text};
+    is $row->{str_default}, 'default test';
 
     # check specified value
-    $values = $factory_maker->create_factory_data(string => 'test1', text => 'texttest');
+    $values = $factory_maker->create_factory_data(string => 'test1', text => 'texttest', str_default => 'default');
     $row = $dbh->selectrow_hashref(
         'select * from test_factory where `int` = ?', {}, $values->{int},
     );
@@ -77,6 +78,7 @@ sub _create_factory_method : Test(12) {
     ok $row->{int} < 100000000;
     is $row->{string}, 'test1';
     is $row->{text}, 'texttest';
+    is $row->{str_default}, 'default';
 }
 
 sub _create_factory_method_specify_sub : Test(7) {
@@ -142,6 +144,50 @@ sub _create_factory_method_install_package : Test(7) {
 
     ok $row;
     is $row->{id}, $values->{id};
+    is $row->{int}, $values->{int};
+    ok $row->{int} < 100000000;
+    is $row->{string}, $values->{string};
+    like $row->{string}, qr{[a-z]{20}};
+    ok !$row->{text};
+}
+
+sub _create_factory_method_creator : Test(8) {
+    my $self = shift;
+    my $dsn  = $self->mysqld->dsn(dbname => 'test_factory');
+    my $dbh  = DBI->connect($dsn, 'root', '');
+    my $factory_maker = DBIx::DataFactory->new({
+        username => 'root',
+        password => '',
+        dsn      => $dsn,
+    });
+    $factory_maker->create_factory_method(
+        method   => 'create_factory_data_creator',
+        table    => 'test_factory',
+        auto_inserted_columns => {
+            int => {
+                type => 'Int',
+                size => 8,
+            },
+            string => sub { return String::Random->new->randregex('[a-z]{20}') },
+        },
+        creator => sub {
+            my ($values) = @_;
+            my $builder = SQL::Maker->new(driver => 'mysql');
+            my ($sql, @binds) = $builder->insert('test_factory', $values);
+            my $sth = $dbh->prepare($sql);
+            $sth->execute(@binds);
+            return $values;
+        },
+    );
+
+    my $values = $factory_maker->create_factory_data_creator();
+    my $row = $dbh->selectrow_hashref(
+        'select * from test_factory where `int` = ?', {}, $values->{int},
+    );
+
+    ok $row;
+    ok $row->{id};
+    ok !$values->{id};
     is $row->{int}, $values->{int};
     ok $row->{int} < 100000000;
     is $row->{string}, $values->{string};
